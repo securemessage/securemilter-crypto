@@ -168,16 +168,35 @@ pub fn base64Encode(allocator: Allocator, data: []const u8) ![]u8 {
     return buf;
 }
 
-/// Base64 decode.
+/// Base64 decode. Strips whitespace (SP, TAB, CR, LF) before decoding,
+/// as DKIM/ARC tag values may contain FWS from header line folding.
 pub fn base64Decode(allocator: Allocator, encoded: []const u8) ![]u8 {
+    // Strip whitespace from input (RFC 6376 §3.5: FWS allowed in tag values)
+    var clean_len: usize = 0;
+    for (encoded) |ch| {
+        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n') clean_len += 1;
+    }
+    const clean = if (clean_len == encoded.len) encoded else blk: {
+        const stripped = try allocator.alloc(u8, clean_len);
+        var idx: usize = 0;
+        for (encoded) |ch| {
+            if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n') {
+                stripped[idx] = ch;
+                idx += 1;
+            }
+        }
+        break :blk stripped;
+    };
+    defer if (clean.ptr != encoded.ptr) allocator.free(@constCast(clean));
+
     const decoder = std.base64.standard;
-    const max_len = try decoder.Decoder.calcSizeUpperBound(encoded.len);
+    const max_len = try decoder.Decoder.calcSizeUpperBound(clean.len);
     const buf = try allocator.alloc(u8, max_len);
-    const written = decoder.Decoder.calcSizeForSlice(encoded) catch |err| {
+    const written = decoder.Decoder.calcSizeForSlice(clean) catch |err| {
         allocator.free(buf);
         return @as(anyerror, err);
     };
-    decoder.Decoder.decode(buf, encoded) catch |err| {
+    decoder.Decoder.decode(buf, clean) catch |err| {
         allocator.free(buf);
         return @as(anyerror, err);
     };
