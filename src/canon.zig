@@ -87,11 +87,18 @@ fn canonicalizeHeaderRelaxed(allocator: Allocator, header: []const u8) ![]u8 {
     var i: usize = 0;
     while (i < value.len) : (i += 1) {
         const c = value[i];
-        // Unfold: skip CRLF if followed by WSP (continuation line)
+        // Unfold: skip CRLF or bare LF if followed by WSP (continuation line)
+        // RFC 5322 specifies CRLF+WSP but many MTAs (including Postfix) use bare LF internally.
         if (c == '\r' and i + 1 < value.len and value[i + 1] == '\n') {
             if (i + 2 < value.len and (value[i + 2] == ' ' or value[i + 2] == '\t')) {
                 // CRLF followed by WSP = folding, treat as WSP
                 i += 1; // skip \n, the \t/space will be handled next iteration
+                in_wsp = true;
+                continue;
+            }
+        } else if (c == '\n') {
+            if (i + 1 < value.len and (value[i + 1] == ' ' or value[i + 1] == '\t')) {
+                // Bare LF followed by WSP = folding, treat as WSP
                 in_wsp = true;
                 continue;
             }
@@ -314,6 +321,15 @@ test "header canonicalization relaxed colon whitespace" {
     const result = try canonicalizeHeader(allocator, .relaxed, input);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("from:user@example.com", result);
+}
+
+test "header canonicalization relaxed bare LF folding" {
+    const allocator = std.testing.allocator;
+    // Bare LF + WSP (common in Postfix milter protocol)
+    const input = "Authentication-Results: mail.test;\n        spf=fail smtp.mailfrom=example.com";
+    const result = try canonicalizeHeader(allocator, .relaxed, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("authentication-results:mail.test; spf=fail smtp.mailfrom=example.com", result);
 }
 
 test "body canonicalization simple strips trailing empty lines" {
