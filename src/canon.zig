@@ -332,6 +332,100 @@ test "header canonicalization relaxed bare LF folding" {
     try std.testing.expectEqualStrings("authentication-results:mail.test; spf=fail smtp.mailfrom=example.com", result);
 }
 
+// Header canonicalization conformance, cross-checked against dkimpy.
+//
+// Every expectation below was produced by an independent implementation rather
+// than derived from this one, so the table checks the reading of RFC 6376 §3.4.1
+// and §3.4.2 and not merely that this module is self-consistent. Added with A-5,
+// which made ARC's AMS path honour the c= tag and so depend on `simple` for the
+// first time -- a latent defect there would previously have gone unnoticed
+// because nothing exercised it.
+//
+// dkimpy emits a trailing CRLF for relaxed; this module leaves that to the
+// caller, so it is absent from the relaxed expectations here.
+test "header canonicalization conformance table" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct {
+        input: []const u8,
+        simple: []const u8,
+        relaxed: []const u8,
+    };
+
+    const cases = [_]Case{
+        .{
+            .input = "From: user@example.com",
+            .simple = "From: user@example.com",
+            .relaxed = "from:user@example.com",
+        },
+        .{
+            // Relaxed lowercases the field name but never the value.
+            .input = "FroM: User@Example.COM",
+            .simple = "FroM: User@Example.COM",
+            .relaxed = "from:User@Example.COM",
+        },
+        .{
+            .input = "From:user@example.com",
+            .simple = "From:user@example.com",
+            .relaxed = "from:user@example.com",
+        },
+        .{
+            .input = "From:   user@example.com   ",
+            .simple = "From:   user@example.com   ",
+            .relaxed = "from:user@example.com",
+        },
+        .{
+            .input = "Subject:\thello\tthere",
+            .simple = "Subject:\thello\tthere",
+            .relaxed = "subject:hello there",
+        },
+        .{
+            .input = "Subject: first line\r\n\tsecond line",
+            .simple = "Subject: first line\r\n\tsecond line",
+            .relaxed = "subject:first line second line",
+        },
+        .{
+            .input = "Subject: a\r\n b\r\n\tc",
+            .simple = "Subject: a\r\n b\r\n\tc",
+            .relaxed = "subject:a b c",
+        },
+        .{
+            .input = "Subject: a    b\t\tc",
+            .simple = "Subject: a    b\t\tc",
+            .relaxed = "subject:a b c",
+        },
+    };
+
+    for (cases) |c| {
+        const got_simple = try canonicalizeHeader(allocator, .simple, c.input);
+        defer allocator.free(got_simple);
+        try std.testing.expectEqualStrings(c.simple, got_simple);
+
+        const got_relaxed = try canonicalizeHeader(allocator, .relaxed, c.input);
+        defer allocator.free(got_relaxed);
+        try std.testing.expectEqualStrings(c.relaxed, got_relaxed);
+    }
+}
+
+test "simple header canonicalization is exact identity" {
+    // RFC 6376 §3.4.1: simple "does not change the header field in any way".
+    // Stated separately from the table so the property is pinned rather than
+    // merely sampled -- the AMS path relies on it since A-5.
+    const allocator = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "From: user@example.com",
+        "X-Odd:\t \t weird   spacing \t",
+        "Folded: a\r\n\tb",
+        "NoColonValue:",
+        "",
+    };
+    for (inputs) |in| {
+        const got = try canonicalizeHeader(allocator, .simple, in);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(in, got);
+    }
+}
+
 test "body canonicalization simple strips trailing empty lines" {
     const allocator = std.testing.allocator;
     var bc = BodyCanonicalizer.init(allocator, .simple);
