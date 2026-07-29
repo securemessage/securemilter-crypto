@@ -137,10 +137,22 @@ fn toLower(c: u8) u8 {
 ///   - Everything else verbatim
 ///
 /// Relaxed (§3.4.4):
-///   - Same trailing-empty-line stripping as simple
 ///   - Reduce all sequences of WSP within a line to single SP
 ///   - Strip all trailing WSP on each line before CRLF
 ///   - Ignore all empty lines at the end
+///   - **An empty result is a null input, NOT a CRLF.** §3.4.4's closing note:
+///     "a completely empty or missing body is canonicalized as a null input".
+///     Only §3.4.3 (simple) converts "0*CRLF" to a single CRLF. The two
+///     algorithms genuinely differ here and the difference is easy to miss,
+///     because §3.4.4 states the rule in a note rather than in its numbered
+///     steps (D-21).
+///
+/// A note on CR and LF, since it decides most of the code below: **only the exact
+/// sequence CRLF terminates a line.** A lone CR or a lone LF is an ordinary data
+/// octet and must survive canonicalization untouched. RFC 5234 defines WSP as SP
+/// or HTAB only, so §3.4.4's "reduce WSP" and "ignore whitespace at the end of
+/// lines" give relaxed no licence whatsoever to touch a CR. This code previously
+/// skipped every CR outright and treated a bare LF as a line terminator (D-22).
 pub const BodyCanonicalizer = struct {
     algorithm: Algorithm,
     allocator: Allocator,
@@ -153,6 +165,16 @@ pub const BodyCanonicalizer = struct {
     in_wsp: bool,
     /// For relaxed: current line buffer being built.
     line_buf: std.ArrayList(u8),
+    /// A CR has been seen and we do not yet know whether an LF follows.
+    ///
+    /// Carried in the struct rather than as a local, because `update()` is a
+    /// streaming API and a CRLF may be split across two calls. The previous code
+    /// looked ahead within the current buffer only (`i + 1 < data.len`), so a
+    /// chunk boundary falling between the CR and the LF turned one line terminator
+    /// into two data octets, corrupting the hash. No caller streamed the body, so
+    /// it never fired -- but the doc comment above invites exactly that, and a
+    /// latent bug in a documented API is a live one waiting for its first caller.
+    pending_cr: bool,
 
     pub fn init(allocator: Allocator, algorithm: Algorithm) BodyCanonicalizer {
         return .{
@@ -162,6 +184,7 @@ pub const BodyCanonicalizer = struct {
             .pending_crlf_count = 0,
             .in_wsp = false,
             .line_buf = .{},
+            .pending_cr = false,
         };
     }
 
@@ -179,19 +202,39 @@ pub const BodyCanonicalizer = struct {
     }
 
     /// Finalize and return the canonicalized body.
-    /// For an empty body, returns CRLF (RFC 6376 §3.4.3/§3.4.4: "a body
-    /// with a zero-length body is canonicalized as a single CRLF").
+    ///
+    /// An empty result differs by algorithm, and this is the D-21 defect: simple
+    /// yields a single CRLF (§3.4.3, "converts 0*CRLF at the end of the body to a
+    /// single CRLF"), while relaxed yields **nothing at all** (§3.4.4, "a
+    /// completely empty or missing body is canonicalized as a null input"). The
+    /// old code emitted CRLF for both and cited §3.4.4 for a rule §3.4.4 does not
+    /// contain.
     pub fn finish(self: *BodyCanonicalizer) ![]u8 {
+        // A CR at the very end of the body never became a terminator, so it was
+        // data all along.
+        if (self.pending_cr) {
+            self.pending_cr = false;
+            switch (self.algorithm) {
+                .simple => {
+                    try self.flushPendingCrlf();
+                    try self.output.append(self.allocator, '\r');
+                },
+                .relaxed => try self.appendRelaxedData('\r'),
+            }
+        }
+
         // Flush any remaining line content (for relaxed, if body doesn't end with CRLF)
         if (self.algorithm == .relaxed and self.line_buf.items.len > 0) {
             try self.flushRelaxedLine();
         }
 
-        // RFC 6376 §3.4.3/§3.4.4: ignore trailing empty lines, then ensure
-        // the body ends with CRLF. An empty body is treated as single CRLF.
-        // pending_crlf_count holds deferred trailing CRLFs — we discard them.
+        // Trailing empty lines are discarded for both algorithms: they are held in
+        // pending_crlf_count and simply never flushed.
         if (self.output.items.len == 0) {
-            try self.output.appendSlice(self.allocator, "\r\n");
+            // The one place the algorithms diverge on an empty result.
+            if (self.algorithm == .simple) {
+                try self.output.appendSlice(self.allocator, "\r\n");
+            }
         } else {
             // Ensure non-empty body ends with exactly one CRLF
             const len = self.output.items.len;
@@ -208,42 +251,90 @@ pub const BodyCanonicalizer = struct {
     fn updateSimple(self: *BodyCanonicalizer, data: []const u8) !void {
         var i: usize = 0;
         while (i < data.len) {
-            // Find next CRLF
-            if (data[i] == '\r' and i + 1 < data.len and data[i + 1] == '\n') {
-                self.pending_crlf_count += 1;
-                i += 2;
-            } else {
-                // Non-CRLF byte: flush all pending CRLFs (they weren't trailing)
+            const c = data[i];
+
+            if (self.pending_cr) {
+                self.pending_cr = false;
+                if (c == '\n') {
+                    // CRLF: a line terminator, deferred in case it turns out to be
+                    // one of the trailing empty lines that get discarded.
+                    self.pending_crlf_count += 1;
+                    i += 1;
+                    continue;
+                }
+                // The CR stood alone, so it was data. Emit it and then reconsider
+                // the current byte from the top without consuming it -- it may
+                // itself be the CR of a following CRLF.
                 try self.flushPendingCrlf();
-                try self.output.append(self.allocator, data[i]);
-                i += 1;
+                try self.output.append(self.allocator, '\r');
+                continue;
             }
+
+            if (c == '\r') {
+                self.pending_cr = true;
+                i += 1;
+                continue;
+            }
+
+            // Any other octet, bare LF included, is data and proves the pending
+            // CRLFs were not trailing after all.
+            try self.flushPendingCrlf();
+            try self.output.append(self.allocator, c);
+            i += 1;
         }
     }
 
     // ---- Relaxed canonicalization ----
 
     fn updateRelaxed(self: *BodyCanonicalizer, data: []const u8) !void {
-        for (data) |c| {
-            if (c == '\r') {
-                // Might be start of CRLF, will handle on next byte
-                continue;
-            }
-            if (c == '\n') {
-                // End of line — flush this line
-                try self.flushRelaxedLine();
-                continue;
-            }
-            if (c == ' ' or c == '\t') {
-                self.in_wsp = true;
-            } else {
-                if (self.in_wsp) {
-                    try self.line_buf.append(self.allocator, ' ');
-                    self.in_wsp = false;
+        var i: usize = 0;
+        while (i < data.len) {
+            const c = data[i];
+
+            if (self.pending_cr) {
+                self.pending_cr = false;
+                if (c == '\n') {
+                    try self.flushRelaxedLine();
+                    i += 1;
+                    continue;
                 }
-                try self.line_buf.append(self.allocator, c);
+                // Lone CR: data, not a terminator. Note this also closes any WSP
+                // run, because the run is no longer at the end of the line -- so
+                // `a   \rb` reduces to `a \rb` and not to `a\rb`.
+                try self.appendRelaxedData('\r');
+                continue;
             }
+
+            if (c == '\r') {
+                self.pending_cr = true;
+                i += 1;
+                continue;
+            }
+
+            if (c == ' ' or c == '\t') {
+                // WSP is only collapsed, never emitted directly: if the line ends
+                // here the run is trailing WSP and must vanish, which is what
+                // dropping `in_wsp` in flushRelaxedLine achieves.
+                self.in_wsp = true;
+                i += 1;
+                continue;
+            }
+
+            // Everything else is data, and a bare LF is data. RFC 5234 WSP is SP
+            // and HTAB only, so LF is not whitespace and §3.4.4 does not reach it.
+            try self.appendRelaxedData(c);
+            i += 1;
         }
+    }
+
+    /// Append one data octet to the current line, first collapsing any pending WSP
+    /// run to the single SP §3.4.4 calls for.
+    fn appendRelaxedData(self: *BodyCanonicalizer, c: u8) !void {
+        if (self.in_wsp) {
+            try self.line_buf.append(self.allocator, ' ');
+            self.in_wsp = false;
+        }
+        try self.line_buf.append(self.allocator, c);
     }
 
     fn flushRelaxedLine(self: *BodyCanonicalizer) !void {
@@ -330,6 +421,170 @@ test "header canonicalization relaxed bare LF folding" {
     const result = try canonicalizeHeader(allocator, .relaxed, input);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("authentication-results:mail.test; spf=fail smtp.mailfrom=example.com", result);
+}
+
+// Body canonicalization conformance, cross-checked against dkimpy.
+//
+// Every expectation was produced by running dkimpy's own canonicalizer, not
+// derived from this module, so the table tests a reading of RFC 6376 §3.4.3 and
+// §3.4.4 rather than this module's self-consistency. That distinction is the
+// whole lesson of D-18: a test that compares an implementation against itself
+// cannot see a mistake the implementation makes twice.
+//
+// The last five rows are the ones that were failing. D-21 is the empty-result
+// divergence; D-22 is CR and LF being treated as structure instead of data.
+test "body canonicalization conformance table" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct {
+        name: []const u8,
+        input: []const u8,
+        simple: []const u8,
+        relaxed: []const u8,
+    };
+
+    const cases = [_]Case{
+        .{
+            .name = "plain text",
+            .input = "hi\r\n",
+            .simple = "hi\r\n",
+            .relaxed = "hi\r\n",
+        },
+        .{
+            .name = "trailing empty lines are dropped by both",
+            .input = "hi\r\n\r\n\r\n",
+            .simple = "hi\r\n",
+            .relaxed = "hi\r\n",
+        },
+        .{
+            .name = "missing final CRLF is added by both",
+            .input = "no newline at end",
+            .simple = "no newline at end\r\n",
+            .relaxed = "no newline at end\r\n",
+        },
+        .{
+            .name = "relaxed strips trailing WSP, simple keeps it",
+            .input = "x   \r\n",
+            .simple = "x   \r\n",
+            .relaxed = "x\r\n",
+        },
+        .{
+            .name = "relaxed collapses WSP runs",
+            .input = "a  b\t\tc\r\n",
+            .simple = "a  b\t\tc\r\n",
+            .relaxed = "a b c\r\n",
+        },
+        .{
+            .name = "WSP-only interior lines become empty under relaxed",
+            .input = "a\r\n   \r\n\t\r\n",
+            .simple = "a\r\n   \r\n\t\r\n",
+            .relaxed = "a\r\n",
+        },
+        // D-21: §3.4.4's closing note, "a completely empty or missing body is
+        // canonicalized as a null input", against §3.4.3's "converts 0*CRLF at the
+        // end of the body to a single CRLF". Both were emitting CRLF.
+        .{
+            .name = "D-21 empty body: null under relaxed, CRLF under simple",
+            .input = "",
+            .simple = "\r\n",
+            .relaxed = "",
+        },
+        .{
+            .name = "D-21 body of one CRLF reduces to the empty case",
+            .input = "\r\n",
+            .simple = "\r\n",
+            .relaxed = "",
+        },
+        .{
+            .name = "D-21 WSP-only body is null under relaxed",
+            .input = "   \r\n",
+            .simple = "   \r\n",
+            .relaxed = "",
+        },
+        // D-22: CR and LF are not WSP (RFC 5234), so neither algorithm may treat a
+        // lone one as a terminator or delete it. Relaxed was doing both.
+        .{
+            .name = "D-22 bare CR is data, not a terminator",
+            .input = "a\rb\r\n",
+            .simple = "a\rb\r\n",
+            .relaxed = "a\rb\r\n",
+        },
+        .{
+            .name = "D-22 bare LF is data, not a terminator",
+            .input = "a\nb\r\n",
+            .simple = "a\nb\r\n",
+            .relaxed = "a\nb\r\n",
+        },
+        .{
+            .name = "D-22 trailing bare CR is data, then CRLF is appended",
+            .input = "abc\r",
+            .simple = "abc\r\r\n",
+            .relaxed = "abc\r\r\n",
+        },
+        .{
+            // The subtle one: the WSP run is not at end of line, because a data
+            // octet follows it, so relaxed collapses it to one SP instead of
+            // deleting it.
+            .name = "D-22 WSP before a bare CR collapses rather than vanishing",
+            .input = "a   \rb\r\n",
+            .simple = "a   \rb\r\n",
+            .relaxed = "a \rb\r\n",
+        },
+    };
+
+    for (cases) |case| {
+        inline for (.{ .simple, .relaxed }) |alg| {
+            var bc = BodyCanonicalizer.init(allocator, alg);
+            defer bc.deinit();
+            try bc.update(case.input);
+            const got = try bc.finish();
+            defer allocator.free(got);
+
+            const want = if (alg == .simple) case.simple else case.relaxed;
+            std.testing.expectEqualStrings(want, got) catch |err| {
+                std.debug.print("\nbody canon {s} failed for {s}\n  input {s}\n", .{ @tagName(alg), case.name, case.input });
+                return err;
+            };
+        }
+    }
+}
+
+// A CRLF split across two update() calls must still be one line terminator.
+//
+// This never fired in production because both callers hand the whole body to a
+// single update(). It is tested anyway because the type's own documentation
+// invites streaming, and the old implementation's lookahead could not see past
+// the end of the current chunk -- so the first caller to stream a body would have
+// silently corrupted every hash whose chunk boundary landed mid-CRLF.
+test "body canonicalization is chunk-boundary safe" {
+    const allocator = std.testing.allocator;
+    const body = "first line\r\nsecond line\r\n\r\n\r\n";
+
+    inline for (.{ .simple, .relaxed }) |alg| {
+        // The whole-body result is the reference.
+        var whole = BodyCanonicalizer.init(allocator, alg);
+        defer whole.deinit();
+        try whole.update(body);
+        const want = try whole.finish();
+        defer allocator.free(want);
+
+        // Every possible split, so no cut point is left untested -- including the
+        // ones that fall between a CR and its LF.
+        var split: usize = 0;
+        while (split <= body.len) : (split += 1) {
+            var bc = BodyCanonicalizer.init(allocator, alg);
+            defer bc.deinit();
+            try bc.update(body[0..split]);
+            try bc.update(body[split..]);
+            const got = try bc.finish();
+            defer allocator.free(got);
+
+            std.testing.expectEqualStrings(want, got) catch |err| {
+                std.debug.print("\n{s} differs when split at {d}\n", .{ @tagName(alg), split });
+                return err;
+            };
+        }
+    }
 }
 
 // Header canonicalization conformance, cross-checked against dkimpy.
