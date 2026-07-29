@@ -44,6 +44,106 @@ pub fn emptyBValue(allocator: Allocator, header: []const u8) ![]u8 {
     return result;
 }
 
+/// Why a tag list is not a valid RFC 6376 §3.2 tag-list.
+pub const TagListError = error{
+    /// No tag-spec at all, or only separators.
+    EmptyTagList,
+    /// A tag-spec with no "=".
+    MissingEquals,
+    /// A tag-name that is not ALPHA *ALNUMPUNC.
+    InvalidTagName,
+    /// The same tag-name twice. §3.2 invalidates the whole list, not the tag.
+    DuplicateTagName,
+    /// More tags than TAG_LIMIT. A bound on the duplicate scan, not a spec rule.
+    TooManyTags,
+};
+
+/// Upper bound on tag-specs in one list.
+///
+/// Not an RFC limit — the ABNF permits any number. It exists because duplicate
+/// detection compares each tag-name against those already seen, which is
+/// quadratic, and a header is only bounded by `MaxHeaderBytes` (1 MB by default).
+/// A megabyte of `a;a;a;…` would be roughly 5·10^5 tags and 10^11 comparisons.
+/// A legitimate DKIM or ARC signature carries around a dozen tags, so 128 leaves
+/// an order of magnitude of headroom while keeping the scan trivial. Same
+/// reasoning as the `MaxSignatures` and `MaxHeaders` caps in the lib.
+pub const TAG_LIMIT = 128;
+
+/// Validate a tag list against RFC 6376 §3.2, strictly.
+///
+///     tag-list  =  tag-spec *( ";" tag-spec ) [ ";" ]
+///     tag-spec  =  [FWS] tag-name [FWS] "=" [FWS] tag-value [FWS]
+///     tag-name  =  ALPHA *ALNUMPUNC
+///     ALNUMPUNC =  ALPHA / DIGIT / "_"
+///
+/// plus the prose requirement in the same section: "Tags with duplicate names
+/// MUST NOT occur within a single tag-list; if a tag name does occur more than
+/// once, the entire tag-list is invalid."
+///
+/// **Tag names are case sensitive here, unlike DMARC.** §3.2 says "Tags MUST be
+/// interpreted in a case-sensitive manner", so `S=` is not `s=` — it is an
+/// unrecognised tag, and a signature relying on it is missing its selector. That
+/// difference is why this lives beside the DKIM/ARC helpers and is *not* shared
+/// with `securedmarc`, whose RFC 9989 §4.7 tag names are case *insensitive*.
+///
+/// An empty tag-value is accepted: the ABNF makes `tag-value` optional, so `a=;`
+/// is syntactically valid. Whether an empty value is *meaningful* belongs to the
+/// tag's own semantics — `a=` with no algorithm is rejected where the algorithm
+/// is chosen, not here — and conflating the two would make this function the
+/// place every tag's rules accumulate.
+///
+/// A single trailing `;` is allowed because the ABNF's `[ ";" ]` allows it. An
+/// interior empty tag-spec (`a=1;;b=2`) is not: that is a `tag-spec` with no
+/// `tag-name`.
+pub fn validateTagList(tag_list: []const u8) TagListError!void {
+    var names: [TAG_LIMIT][]const u8 = undefined;
+    var count: usize = 0;
+
+    var rest = tag_list;
+    while (true) {
+        const semi = mem.indexOfScalar(u8, rest, ';');
+        const spec_raw = if (semi) |s| rest[0..s] else rest;
+        const spec = mem.trim(u8, spec_raw, &FWS);
+
+        if (spec.len == 0) {
+            // Empty spec. Legal only as the optional trailing ";" -- that is,
+            // when nothing but whitespace follows it.
+            const tail = if (semi) |s| rest[s + 1 ..] else "";
+            if (mem.trim(u8, tail, &FWS).len == 0) break;
+            return error.InvalidTagName;
+        }
+
+        const eq = mem.indexOfScalar(u8, spec, '=') orelse return error.MissingEquals;
+        const name = mem.trim(u8, spec[0..eq], &FWS);
+        if (name.len == 0) return error.InvalidTagName;
+        if (!isAlpha(name[0])) return error.InvalidTagName;
+        for (name[1..]) |c| {
+            if (!isAlpha(c) and !isDigit(c) and c != '_') return error.InvalidTagName;
+        }
+
+        if (count == TAG_LIMIT) return error.TooManyTags;
+        for (names[0..count]) |seen| {
+            if (mem.eql(u8, seen, name)) return error.DuplicateTagName;
+        }
+        names[count] = name;
+        count += 1;
+
+        if (semi) |s| rest = rest[s + 1 ..] else break;
+    }
+
+    if (count == 0) return error.EmptyTagList;
+}
+
+const FWS = [_]u8{ ' ', '\t', '\r', '\n' };
+
+fn isAlpha(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
 /// Byte range of the `b=` tag's value within a signature header field.
 pub const ValueSpan = struct {
     /// First byte of the value, immediately after the `=`.
@@ -229,4 +329,59 @@ test "tagListStart distinguishes a field name from a tag list" {
     try std.testing.expectEqual(@as(usize, 0), tagListStart("v=1; b=x"));
     // The colons inside an h= value must not be read as a field name.
     try std.testing.expectEqual(@as(usize, 0), tagListStart("h=from:to:subject; b=x"));
+}
+
+test "validateTagList accepts what RFC 6376 3.2 allows" {
+    // A real ARC-Seal tag list.
+    try validateTagList("i=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=dummy; t=12345; b=abc");
+    // The ABNF's optional trailing ";".
+    try validateTagList("a=1; b=2;");
+    // FWS around names, "=" and values, including a fold.
+    try validateTagList(" a = 1 ;\r\n b\t=\t2 ");
+    // An empty tag-value is syntactically fine; whether it MEANS anything is the
+    // individual tag's business, not this function's.
+    try validateTagList("a=; b=2");
+    // Unknown tags are ignored by consumers, not rejected by the syntax.
+    try validateTagList("a=1; zz_9=x; b=2");
+    // Digits and "_" are legal after the first character.
+    try validateTagList("a1=x; b_2=y");
+    // A value may contain "=" (base64 padding) and ":" (an h= list).
+    try validateTagList("bh=dHN66dCN+jxb8=; h=from:to:subject");
+}
+
+test "validateTagList rejects what RFC 6376 3.2 forbids" {
+    // tag-name must be ALPHA *ALNUMPUNC -- "_" may not lead.
+    try std.testing.expectError(error.InvalidTagName, validateTagList("a=1; _=; b=2"));
+    try std.testing.expectError(error.InvalidTagName, validateTagList("1a=x"));
+    try std.testing.expectError(error.InvalidTagName, validateTagList("a-b=x"));
+    // "Tags with duplicate names MUST NOT occur within a single tag-list; if a
+    // tag name does occur more than once, the entire tag-list is invalid."
+    try std.testing.expectError(error.DuplicateTagName, validateTagList("s=dummy; s=dummy"));
+    try std.testing.expectError(error.DuplicateTagName, validateTagList("a=1; b=2; a=3"));
+    // An interior empty tag-spec. Only a single trailing ";" is permitted.
+    try std.testing.expectError(error.InvalidTagName, validateTagList("s=dummy;; t=1"));
+    try std.testing.expectError(error.InvalidTagName, validateTagList(";a=1"));
+    // A spec with no "=".
+    try std.testing.expectError(error.MissingEquals, validateTagList("a=1; oops; b=2"));
+    // Nothing at all.
+    try std.testing.expectError(error.EmptyTagList, validateTagList(""));
+    try std.testing.expectError(error.EmptyTagList, validateTagList(";"));
+}
+
+test "validateTagList is case sensitive, unlike DMARC" {
+    // Both are valid syntax; they are simply different tags. The consequence is
+    // in the consumer: a lookup for "s" must not be satisfied by "S".
+    try validateTagList("s=dummy; S=other");
+}
+
+test "validateTagList bounds the duplicate scan" {
+    // TAG_LIMIT exists so the quadratic duplicate check cannot be turned into a
+    // denial of service by a header full of tags. Build one tag past the cap.
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i <= TAG_LIMIT) : (i += 1) {
+        try buf.writer(std.testing.allocator).print("a{d}=x;", .{i});
+    }
+    try std.testing.expectError(error.TooManyTags, validateTagList(buf.items));
 }
