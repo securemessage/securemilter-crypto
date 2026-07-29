@@ -229,20 +229,47 @@ pub fn freePublicKey(pkey: *c.EVP_PKEY) void {
     c.EVP_PKEY_free(pkey);
 }
 
-/// Ed25519 signing using Zig's std.crypto.
-pub fn ed25519Sign(seed: [32]u8, data: []const u8) ![64]u8 {
+/// The `ed25519-sha256` DKIM signing algorithm, RFC 8463 §3.
+///
+/// **`data` is the canonicalized signing input, and this function hashes it.**
+/// RFC 8463 §3 defines the algorithm as: "computes a message hash as defined in
+/// Section 3 of [RFC6376] using SHA-256 as the hash-alg. It signs *the hash*
+/// with the PureEdDSA variant Ed25519". So the 32-byte SHA-256 digest is the
+/// EdDSA message, not the signing input itself.
+///
+/// The SHA-256 step is inside these two functions, and the functions are named
+/// for the RFC's algorithm rather than for the curve, because the alternative
+/// already failed: they were `ed25519Sign`/`ed25519Verify` taking the signing
+/// input raw, and both call sites in `securedkim` duly passed the header block
+/// straight through. Nothing caught it, because sign and verify were wrong in
+/// the same direction and round-tripped perfectly against each other -- the
+/// signatures were self-consistent and interoperable with nobody. RFC 8463
+/// Appendix A found it in one run.
+///
+/// Note the asymmetry with RSA that makes this easy to miss: `rsaVerify` is given
+/// the same signing input and is correct, because OpenSSL's `EVP_DigestVerify`
+/// applies SHA-256 internally. PureEdDSA hashes with SHA-512 as part of EdDSA
+/// itself and knows nothing about the DKIM hash-alg, so the caller must supply
+/// the digest. Passing the signing input to both *looks* uniform and is only
+/// right for one of them.
+pub fn ed25519Sha256Sign(seed: [32]u8, data: []const u8) ![64]u8 {
     const Ed25519 = std.crypto.sign.Ed25519;
     const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
-    const sig = try key_pair.sign(data, null);
+    const digest = sha256(data);
+    const sig = try key_pair.sign(&digest, null);
     return sig.toBytes();
 }
 
-/// Ed25519 verification using Zig's std.crypto.
-pub fn ed25519Verify(public_key: [32]u8, data: []const u8, signature: [64]u8) !bool {
+/// Verify an `ed25519-sha256` DKIM signature, RFC 8463 §3.
+///
+/// `data` is the canonicalized signing input; see `ed25519Sha256Sign` for why
+/// this function, and not its caller, applies SHA-256.
+pub fn ed25519Sha256Verify(public_key: [32]u8, data: []const u8, signature: [64]u8) !bool {
     const Ed25519 = std.crypto.sign.Ed25519;
     const pk = Ed25519.PublicKey.fromBytes(public_key) catch return false;
     const sig = Ed25519.Signature.fromBytes(signature);
-    sig.verify(data, pk) catch return false;
+    const digest = sha256(data);
+    sig.verify(&digest, pk) catch return false;
     return true;
 }
 
@@ -348,17 +375,35 @@ test "base64 round trip" {
     try std.testing.expectEqualStrings(original, decoded);
 }
 
-test "ed25519 sign and verify" {
+test "ed25519-sha256 signs the SHA-256 digest, not the signing input (RFC 8463 3)" {
     const seed = [_]u8{0x42} ** 32;
     const data = "test message for signing";
-    const sig = try ed25519Sign(seed, data);
+    const sig = try ed25519Sha256Sign(seed, data);
 
     const Ed25519 = std.crypto.sign.Ed25519;
     const kp = try Ed25519.KeyPair.generateDeterministic(seed);
     const pub_key = kp.public_key.toBytes();
 
-    try std.testing.expect(try ed25519Verify(pub_key, data, sig));
-    try std.testing.expect(!try ed25519Verify(pub_key, "wrong message", sig));
+    try std.testing.expect(try ed25519Sha256Verify(pub_key, data, sig));
+    try std.testing.expect(!try ed25519Sha256Verify(pub_key, "wrong message", sig));
+
+    // Everything above is a round trip, and a round trip is what let the
+    // original bug ship: sign and verify both used the signing input as the
+    // EdDSA message, agreed with each other perfectly, and interoperated with
+    // nothing. The two checks below are the ones with teeth, because they
+    // compare against std.crypto rather than against our other function.
+    const digest = sha256(data);
+    const parsed = Ed25519.Signature.fromBytes(sig);
+
+    // The EdDSA message MUST be the 32-byte SHA-256 digest.
+    try parsed.verify(&digest, kp.public_key);
+
+    // And it MUST NOT be the signing input itself.
+    const raw_input_verifies = blk: {
+        parsed.verify(data, kp.public_key) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!raw_input_verifies);
 }
 
 /// Generate an RSA key of a given size for tests.
