@@ -82,7 +82,7 @@ pub const HTag = struct {
         while (scan.pos < scan.full.len) {
             const raw = scan.take();
             const nm = mem.trim(u8, raw, " \t\r\n");
-            if (nm.len != 0 and eqlIgnoreCase(nm, name)) seen += 1;
+            if (nm.len != 0 and std.ascii.eqlIgnoreCase(nm, name)) seen += 1;
         }
         return seen;
     }
@@ -104,7 +104,7 @@ pub fn selectInstance(
     var i = headers.len;
     while (i > 0) {
         i -= 1;
-        if (!eqlIgnoreCase(nameOf(headers[i]), wanted)) continue;
+        if (!std.ascii.eqlIgnoreCase(nameOf(headers[i]), wanted)) continue;
         if (remaining == 0) return i;
         remaining -= 1;
     }
@@ -155,18 +155,6 @@ pub fn nameOfLine(line: []const u8) []const u8 {
 /// Walk `h_tag` against raw `Name: value` header lines.
 pub fn lineWalker(h_tag: []const u8, lines: []const []const u8) Walker([]const u8, nameOfLine) {
     return walker([]const u8, nameOfLine, h_tag, lines);
-}
-
-pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(ch: u8) u8 {
-    return if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
 }
 
 // --- tests -------------------------------------------------------------------

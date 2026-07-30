@@ -72,7 +72,7 @@ fn canonicalizeHeaderRelaxed(allocator: Allocator, header: []const u8) ![]u8 {
     const name_raw = header[0..colon_pos];
     const name = mem.trimRight(u8, name_raw, " \t");
     for (name) |c| {
-        try result.append(allocator, toLower(c));
+        try result.append(allocator, std.ascii.toLower(c));
     }
     try result.append(allocator, ':');
 
@@ -115,11 +115,6 @@ fn canonicalizeHeaderRelaxed(allocator: Allocator, header: []const u8) ![]u8 {
     }
 
     return result.toOwnedSlice(allocator);
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 // =============================================================================
