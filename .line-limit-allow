@@ -1,3 +1,29 @@
+# 2026-07-31, C-1 and C-2: crypto.zig crosses the 400 goal at 410.
+#
+#   First entry on this list; the file had never been over. C-2 moved the Ed25519
+#   keypair into `SigningKey` so it is derived once at load instead of per signature,
+#   and C-1 gave `deinit` an explicit `secureZero` over the expanded secret, which had
+#   simply gone out of scope until now.
+#
+#   About fifteen lines are code and the rest is comment, already cut back once from
+#   426 -- the `deinit` note in particular, which has to record that the wipe LOOKS
+#   redundant (this compiler zeroes an optional's payload on `= null`, so no test can
+#   separate the two) without inviting the next reader to delete it.
+#
+#   THE SEAM, NAMED SO THIS IS A DEBT AND NOT AN IOU: split `SigningKey`, its loaders
+#   and the size checks -- `loadRsaKeyFile`, `loadRsaKeyBytes`, `loadEd25519Seed`,
+#   `checkPrivateKeyBits`, `pkeyRsaBits`, `signingKeyBits`, `resolveMinRsaBits`,
+#   `loadRsaPublicKeyDer`, `freePublicKey` -- from the primitives that consume them:
+#   `rsaSign`, `rsaVerify`, `ed25519Sha256Sign`, `ed25519Sha256Verify`, `sha256`,
+#   `Sha256Hasher`, `base64Encode`, `base64Decode`. "What a key is and how it is
+#   admitted" against "the operations", which is the same cut `settings.zig` and
+#   `bootstrap.zig` already got.
+#
+#   NOT TAKEN HERE ON PURPOSE. This was a batch of ten small remediations across five
+#   repositories; opening a module split inside it would mix a refactor into a set of
+#   fixes that each have their own regression test, and make the whole thing harder to
+#   review or revert. It belongs to the refactor stage that owns the other splits.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -10,3 +36,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
+410 src/crypto.zig

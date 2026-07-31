@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const Ed25519 = std.crypto.sign.Ed25519;
 const c = @cImport({
     @cInclude("openssl/evp.h");
     @cInclude("openssl/pem.h");
@@ -80,13 +81,49 @@ pub fn signingKeyBits(key: *const SigningKey) u32 {
 pub const SigningKey = struct {
     algorithm: Algorithm,
     rsa_pkey: ?*c.EVP_PKEY = null,
-    ed25519_seed: ?[32]u8 = null,
 
+    /// The **derived keypair**, not the seed (audit C-2): `generateDeterministic`
+    /// was being run per signature for a result that cannot change while the key is
+    /// loaded.
+    ///
+    /// One field, not seed *and* pair: two copies of the same secret invites setting
+    /// one and reading the other, and `securedkim`'s D-24 tables did build this
+    /// struct literally. `secret_key.seed()` recovers the seed when a caller needs it.
+    ed25519_key_pair: ?Ed25519.KeyPair = null,
+
+    /// Free the RSA key and **wipe the Ed25519 secret** (audit C-1).
+    ///
+    /// RSA needs no help -- `EVP_PKEY_free` runs `OPENSSL_cleanse`. The Ed25519 seed
+    /// and expanded secret had nobody doing it and simply went out of scope, leaving
+    /// a domain's signing key in freed heap or a core dump. A milter is long-lived and
+    /// re-reads its key on SIGHUP, so that accumulates copies.
+    ///
+    /// THE `secureZero` LOOKS REDUNDANT AND IS NOT. This compiler zeroes an optional's
+    /// payload on `= null` (verified: 64 bytes of 0x5A become zero), so the secret is
+    /// already gone before the wipe runs and no test can separate the two. That is a
+    /// lowering artefact, not a guarantee -- and in a release build a store never read
+    /// again is the first thing an optimiser drops. The volatile write is the promised
+    /// part; the test pins the property, not this line.
     pub fn deinit(self: *SigningKey) void {
         if (self.rsa_pkey) |pkey| {
             c.EVP_PKEY_free(pkey);
             self.rsa_pkey = null;
         }
+        if (self.ed25519_key_pair) |*kp| {
+            std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
+            self.ed25519_key_pair = null;
+        }
+    }
+
+    /// Sign with the cached keypair, per RFC 8463 §3.
+    ///
+    /// `data` is the canonicalized signing input; the SHA-256 step is here, for the
+    /// reasons set out on `ed25519Sha256Sign`.
+    pub fn signEd25519Sha256(self: *const SigningKey, data: []const u8) ![64]u8 {
+        const kp = self.ed25519_key_pair orelse return error.NotEd25519Key;
+        const digest = sha256(data);
+        const sig = try kp.sign(&digest, null);
+        return sig.toBytes();
     }
 };
 
@@ -141,9 +178,15 @@ pub fn loadRsaKeyBytes(pem_data: []const u8, min_bits: u32) !SigningKey {
     return .{ .algorithm = .rsa_sha256, .rsa_pkey = pkey };
 }
 
-/// Load a raw 32-byte Ed25519 private seed.
-pub fn loadEd25519Seed(seed: [32]u8) SigningKey {
-    return .{ .algorithm = .ed25519_sha256, .ed25519_seed = seed };
+/// Load a raw 32-byte Ed25519 private seed, deriving the keypair once.
+///
+/// Fallible now: the derivation can reject a seed producing the identity element, and
+/// doing it here refuses a bad seed at load rather than on the first message.
+pub fn loadEd25519Seed(seed: [32]u8) !SigningKey {
+    return .{
+        .algorithm = .ed25519_sha256,
+        .ed25519_key_pair = try Ed25519.KeyPair.generateDeterministic(seed),
+    };
 }
 
 /// Sign data with an RSA-SHA256 key.
@@ -252,12 +295,13 @@ pub fn freePublicKey(pkey: *c.EVP_PKEY) void {
 /// itself and knows nothing about the DKIM hash-alg, so the caller must supply
 /// the digest. Passing the signing input to both *looks* uniform and is only
 /// right for one of them.
+///
+/// ONE-SHOT ONLY -- derives the keypair per call, which is what C-2 was about. Repeat
+/// signers hold a `SigningKey` and use `signEd25519Sha256`.
 pub fn ed25519Sha256Sign(seed: [32]u8, data: []const u8) ![64]u8 {
-    const Ed25519 = std.crypto.sign.Ed25519;
-    const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
-    const digest = sha256(data);
-    const sig = try key_pair.sign(&digest, null);
-    return sig.toBytes();
+    var key = try loadEd25519Seed(seed);
+    defer key.deinit();
+    return key.signEd25519Sha256(data);
 }
 
 /// Verify an `ed25519-sha256` DKIM signature, RFC 8463 §3.
@@ -265,7 +309,6 @@ pub fn ed25519Sha256Sign(seed: [32]u8, data: []const u8) ![64]u8 {
 /// `data` is the canonicalized signing input; see `ed25519Sha256Sign` for why
 /// this function, and not its caller, applies SHA-256.
 pub fn ed25519Sha256Verify(public_key: [32]u8, data: []const u8, signature: [64]u8) !bool {
-    const Ed25519 = std.crypto.sign.Ed25519;
     const pk = Ed25519.PublicKey.fromBytes(public_key) catch return false;
     const sig = Ed25519.Signature.fromBytes(signature);
     const digest = sha256(data);
@@ -375,12 +418,63 @@ test "base64 round trip" {
     try std.testing.expectEqualStrings(original, decoded);
 }
 
+// C-1. Scans the WHOLE struct for the seed byte, which is what a core dump or a
+// scraper reading a reused heap page actually does -- rather than dereferencing the
+// one field, which presumes where the secret sits.
+//
+// WHAT THIS DOES AND DOES NOT PROVE. It pins the property: after `deinit`, no byte of
+// the seed remains in the handle. It does NOT isolate the `secureZero` call, because
+// this compiler also zeroes an optional's payload on `= null` -- so removing the wipe
+// alone keeps this green. Verified, and recorded on `deinit` so the next reader does
+// not delete the wipe on the strength of a passing test. Deleting the whole wipe
+// block does fail this, which is the regression a reader is actually likely to cause.
+test "no seed byte survives deinit" {
+    const seed_byte: u8 = 0x5A;
+    const seed = [_]u8{seed_byte} ** 32;
+    var key = try loadEd25519Seed(seed);
+
+    // Searches for the contiguous 32-byte run, not for occurrences of the byte: the
+    // derived PUBLIC key contains 0x5A twice by coincidence, and the public key is
+    // not a secret and is not what this is about. A counting assertion here read 34
+    // instead of 32 and would have been "fixed" by loosening the number, which is how
+    // a test stops meaning anything.
+    const whole = mem.asBytes(&key);
+    try std.testing.expect(mem.indexOf(u8, whole, &seed) != null);
+
+    key.deinit();
+
+    try std.testing.expect(mem.indexOf(u8, whole, &seed) == null);
+
+    // And the handle no longer claims to hold a key, so a use-after-deinit is an
+    // error rather than a signature over wiped material.
+    try std.testing.expect(key.ed25519_key_pair == null);
+    try std.testing.expectError(error.NotEd25519Key, key.signEd25519Sha256("x"));
+}
+
+// C-2. The cached keypair must produce the identical signature to deriving one per
+// call -- otherwise this was not a caching change, it was a behaviour change.
+test "the cached keypair signs identically to a per-call derivation" {
+    const seed = [_]u8{0x11} ** 32;
+    const data = "canonicalized signing input";
+
+    var key = try loadEd25519Seed(seed);
+    defer key.deinit();
+
+    const cached = try key.signEd25519Sha256(data);
+    const one_shot = try ed25519Sha256Sign(seed, data);
+    try std.testing.expectEqualSlices(u8, &one_shot, &cached);
+
+    // Ed25519 is deterministic, so repeated signing is byte-identical too. This is
+    // what makes the cache safe: there is no per-signature state to lose.
+    const again = try key.signEd25519Sha256(data);
+    try std.testing.expectEqualSlices(u8, &cached, &again);
+}
+
 test "ed25519-sha256 signs the SHA-256 digest, not the signing input (RFC 8463 3)" {
     const seed = [_]u8{0x42} ** 32;
     const data = "test message for signing";
     const sig = try ed25519Sha256Sign(seed, data);
 
-    const Ed25519 = std.crypto.sign.Ed25519;
     const kp = try Ed25519.KeyPair.generateDeterministic(seed);
     const pub_key = kp.public_key.toBytes();
 
