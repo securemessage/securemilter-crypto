@@ -14,7 +14,7 @@ const mem = std.mem;
 /// second takes nothing. If anyone later prepends a second `From:`, a verifier's
 /// second mention now finds it, the hash changes, and the signature breaks. It
 /// is how a signer nails down a field against later addition, and OpenDKIM's
-/// `OversignHeaders` turns it on for `from` in a great many deployments.
+/// `OverSignHeaders` turns it on for `from` in a great many deployments.
 ///
 /// Every copy of this logic in the suite returned the *last* matching header for
 /// every mention. Two consequences, and the interop one is the expensive half:
@@ -155,6 +155,96 @@ pub fn nameOfLine(line: []const u8) []const u8 {
 /// Walk `h_tag` against raw `Name: value` header lines.
 pub fn lineWalker(h_tag: []const u8, lines: []const []const u8) Walker([]const u8, nameOfLine) {
     return walker([]const u8, nameOfLine, h_tag, lines);
+}
+
+/// Instances of `wanted` present in the message.
+fn countInstances(
+    comptime T: type,
+    comptime nameOf: fn (T) []const u8,
+    headers: []const T,
+    wanted: []const u8,
+) usize {
+    var n: usize = 0;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(nameOf(h), wanted)) n += 1;
+    }
+    return n;
+}
+
+/// Times `wanted` is named in an `h=` list.
+fn countMentions(h_tag: []const u8, wanted: []const u8) usize {
+    var n: usize = 0;
+    var it = HTag.init(h_tag);
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, wanted)) n += 1;
+    }
+    return n;
+}
+
+/// Extend an `h=` list so each name in `oversign` is listed one more time than
+/// the message actually contains it (audit D-12). Caller owns the result.
+///
+/// RFC 6376 §5.4: "Signers MAY claim to have signed header fields that do not
+/// exist ... the nonexisting header field MUST be treated as the null string",
+/// and the rationale given is that "if that header field is added later, the
+/// signature will fail". The count comes from the same section's informative
+/// note: a name "need only be listed once more than the actual number of that
+/// header field in a message at the time of signing in order to prevent any
+/// further additions".
+///
+/// Computed against the actual count rather than hardcoded to two mentions,
+/// because two is only correct when the field appears exactly once. A message
+/// carrying two `From:` fields and signed with `h=from:from` is *not* protected:
+/// both mentions find a real field and a third could still be added. Rare, but
+/// the whole value of this feature is that the guarantee holds without the
+/// operator having to think about it.
+///
+/// A name absent from the message gets one mention, which asserts its absence --
+/// the RFC's stated purpose above, and useful on its own.
+///
+/// Appending keeps the operator's own list intact and in their order, so what
+/// they configured is still legible in the emitted signature.
+pub fn oversignedTag(
+    comptime T: type,
+    comptime nameOf: fn (T) []const u8,
+    allocator: mem.Allocator,
+    h_tag: []const u8,
+    oversign: []const u8,
+    headers: []const T,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    // Trailing separators would compound into empty entries on each append.
+    // HTag ignores those, but the emitted `h=` is read by operators too.
+    try out.appendSlice(allocator, mem.trim(u8, h_tag, " \t\r\n:"));
+
+    var names = HTag.init(oversign);
+    while (names.next()) |entry| {
+        // `skip` counts earlier mentions of this same name, so a repeated entry
+        // in the operator's oversign list is already handled and must not be
+        // applied twice.
+        if (entry.skip > 0) continue;
+
+        const want = countInstances(T, nameOf, headers, entry.name) + 1;
+        var have = countMentions(out.items, entry.name);
+        while (have < want) : (have += 1) {
+            if (out.items.len > 0) try out.append(allocator, ':');
+            try out.appendSlice(allocator, entry.name);
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// `oversignedTag` against raw `Name: value` header lines.
+pub fn oversignedLineTag(
+    allocator: mem.Allocator,
+    h_tag: []const u8,
+    oversign: []const u8,
+    lines: []const []const u8,
+) ![]u8 {
+    return oversignedTag([]const u8, nameOfLine, allocator, h_tag, oversign, lines);
 }
 
 // --- tests -------------------------------------------------------------------
@@ -337,4 +427,108 @@ test "the walker works over a name/value representation too" {
     try testing.expectEqualStrings("top@example.com", w.next().?.value);
     // Third mention: nothing left, so nothing is hashed.
     try testing.expectEqual(@as(?Header, null), w.next());
+}
+
+// --- D-12: building the oversigned h= ----------------------------------------
+
+fn expectOversigned(
+    expected: []const u8,
+    h_tag: []const u8,
+    oversign: []const u8,
+    lines: []const []const u8,
+) !void {
+    const got = try oversignedLineTag(testing.allocator, h_tag, oversign, lines);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(expected, got);
+}
+
+test "D-12: one From is listed twice" {
+    try expectOversigned(
+        "from:to:subject:date:message-id:from",
+        "from:to:subject:date:message-id",
+        "from",
+        &.{ "From: a@example.com", "To: b@example.com", "Subject: hi" },
+    );
+}
+
+test "D-12: two From fields need three mentions, not two" {
+    // The case a hardcoded "list it twice" gets wrong. With two real From
+    // fields, `h=from:from` leaves both mentions consuming real headers and a
+    // third From could still be appended without breaking the signature.
+    try expectOversigned(
+        "from:to:from:from",
+        "from:to",
+        "from",
+        &.{ "From: a@example.com", "From: b@example.com", "To: c@example.com" },
+    );
+}
+
+test "D-12: a header absent from the message is named once, asserting absence" {
+    try expectOversigned(
+        "from:to:from:sender",
+        "from:to",
+        "from:sender",
+        &.{ "From: a@example.com", "To: b@example.com" },
+    );
+}
+
+test "D-12: an operator who already oversigned is not extended again" {
+    // Idempotent against a list that already satisfies the rule, so enabling the
+    // default on a config that had been oversigning by hand does not silently
+    // add a third mention and change every signature.
+    try expectOversigned(
+        "from:from:to",
+        "from:from:to",
+        "from",
+        &.{ "From: a@example.com", "To: b@example.com" },
+    );
+}
+
+test "D-12: a name repeated in the oversign list is applied once" {
+    try expectOversigned(
+        "from:to:from",
+        "from:to",
+        "from:from",
+        &.{ "From: a@example.com", "To: b@example.com" },
+    );
+}
+
+test "D-12: a trailing colon does not compound into empty entries" {
+    try expectOversigned(
+        "from:to:from",
+        "from:to:",
+        "from",
+        &.{ "From: a@example.com", "To: b@example.com" },
+    );
+}
+
+test "D-12: the oversigned tag still selects exactly the real headers" {
+    // The property that makes the whole thing safe: adding the extra mention
+    // must not change WHAT gets hashed today, only what would break tomorrow.
+    // If this ever selected the same From twice, every oversigned signature we
+    // emit would be unverifiable -- which is precisely the D-1 defect.
+    const lines = [_][]const u8{ "From: a@example.com", "To: b@example.com" };
+
+    const tag = try oversignedLineTag(testing.allocator, "from:to", "from", &lines);
+    defer testing.allocator.free(tag);
+    try testing.expectEqualStrings("from:to:from", tag);
+
+    try expectSelected(
+        &.{ "From: a@example.com", "To: b@example.com" },
+        tag,
+        &lines,
+    );
+
+    // And once a second From is added, the spare mention finds it, so the hash
+    // changes and the signature breaks. That is the entire point.
+    const tampered = [_][]const u8{
+        "From: attacker@evil.test",
+        "From: a@example.com",
+        "To: b@example.com",
+    };
+    try expectSelected(
+        &.{ "From: a@example.com", "To: b@example.com", "From: attacker@evil.test" },
+        tag,
+        &tampered,
+    );
 }
