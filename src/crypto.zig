@@ -38,6 +38,83 @@ pub const RFC8301_MIN_RSA_BITS: u32 = 1024;
 /// the operator's setting, which is invisible until someone audits a header.
 pub const MIN_KEY_BITS_OPTION = "MinimumKeyBits";
 
+/// Whether a private key file's permissions must be checked before it is used.
+///
+/// A required argument on `loadRsaKeyFile` for the same reason `min_bits` is: a
+/// new caller has to decide, rather than inherit a default that happens to be
+/// wrong for it. The daemons pass `.require_safe`; the inspection tools pass
+/// `.permit_any` because their job is to *report* on a key an operator handed
+/// them, and refusing to look at a badly-permissioned key is the one thing that
+/// would stop them saying so.
+pub const KeyFileTrust = enum {
+    /// Refuse the key if any group or other permission bit is set.
+    require_safe,
+    /// Load whatever is readable and say nothing about its mode.
+    permit_any,
+};
+
+/// What to tell an operator whose key was refused.
+///
+/// Shared for the same reason as `MIN_KEY_BITS_OPTION`: three daemons reporting
+/// the same fault in three wordings is three things to get subtly wrong, and the
+/// advice is the part that has to be right -- `chown` matters as much as `chmod`
+/// here, because the key is re-read after the privilege drop.
+pub const KEY_PERMISSIONS_ADVICE =
+    "readable beyond its owner: chmod 600 and chown it to the user the daemon drops to";
+
+/// Permission bits of `path`, with the file-type bits masked off.
+///
+/// Exposed so a caller that has just been refused can name the mode it found:
+/// "0644" in a log line is actionable, `error.KeyFilePermissionsTooOpen` on its
+/// own is not.
+pub fn keyFileMode(path: []const u8) !u16 {
+    const st = try std.fs.cwd().statFile(path);
+    return @intCast(st.mode & 0o7777);
+}
+
+/// Refuse a private key any account other than its owner can reach.
+///
+/// A DKIM or ARC signing key is a bearer credential for a domain: anyone who can
+/// read it can produce signatures that verify, indefinitely, for every message
+/// they care to forge. `securedkim-genkey` has created keys 0600 at `open` since
+/// audit D-8, but that only covers keys this suite generated. Keys arrive by
+/// other routes -- `openssl genrsa`, a restore from backup, a configuration
+/// management system, a copy between hosts -- and every one of those paths can
+/// land a 0644 file that the daemon would otherwise load without comment.
+///
+/// The rule is ssh's and opendkim's: any bit set in the group or other triads is
+/// a refusal. Group-readable is included deliberately, even though "group
+/// readable by the daemon's own group" sounds harmless -- it means every account
+/// in that group holds the domain's signing authority, which is not a property
+/// anyone intends to grant and not one that shows up in a configuration review.
+///
+/// THIS IS A MISCONFIGURATION GUARD, NOT A DEFENCE AGAINST AN ACTIVE ATTACKER,
+/// and the distinction sets how much the check has to do. It stats the path and
+/// then lets OpenSSL open it, so a sufficiently-placed attacker could swap the
+/// file in between. That is accepted rather than closed with an fstat-on-our-own
+/// fd, because anyone who can replace the file at that instant can equally write
+/// their own key there beforehand and be loaded legitimately -- the window buys
+/// them nothing they do not already have. What the check does catch is the case
+/// that actually occurs: a key sitting at 0644 because whoever installed it did
+/// not think about the mode.
+///
+/// THERE IS DELIBERATELY NO CONFIGURATION OVERRIDE, which is worth justifying
+/// because opendkim ships one (`RequireSafeKeys`) and its absence here is a
+/// choice rather than an omission. An override earns its place when the strict
+/// rule would refuse a deployment that is actually sound, and for these daemons
+/// there is no such deployment. The key is read twice: once at startup while
+/// still root, and again on SIGHUP *after* the drop to the unprivileged user --
+/// so for reload to work at all the key must be readable by that user, which
+/// means owning it as that user at 0600. That is exactly the arrangement this
+/// check accepts. The one it rejects, group-readable, does not become necessary
+/// under privilege drop; it is just an exposure. So the answer to a refusal is
+/// `chmod 600`, and a flag to silence it would only ever be used to keep a key
+/// exposed. Adding one later is a small change if a real case turns up.
+fn requireSafeKeyFile(path: []const u8) !void {
+    const perms = try keyFileMode(path);
+    if (perms & 0o077 != 0) return error.KeyFilePermissionsTooOpen;
+}
+
 /// Outcome of reconciling a configured minimum with the RFC floor.
 pub const MinRsaBits = struct {
     bits: u32,
@@ -148,12 +225,19 @@ fn checkPrivateKeyBits(pkey: *c.EVP_PKEY, min_bits: u32) !void {
 ///
 /// `min_bits` is a required argument, not a default, so that adding a new
 /// caller forces a decision about it. Pass `RFC8301_MIN_RSA_BITS` to sign, or 0
-/// to inspect a key without enforcing anything.
-pub fn loadRsaKeyFile(path: []const u8, min_bits: u32) !SigningKey {
+/// to inspect a key without enforcing anything. `trust` is required for the same
+/// reason -- see `KeyFileTrust`.
+///
+/// The permission check runs before the size check, because a key that is both
+/// too small and world-readable should report the exposure first: the operator
+/// has to replace it either way, and only one of the two facts is urgent.
+pub fn loadRsaKeyFile(path: []const u8, min_bits: u32, trust: KeyFileTrust) !SigningKey {
     var path_buf: [4096]u8 = undefined;
     if (path.len >= path_buf.len) return error.PathTooLong;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
+
+    if (trust == .require_safe) try requireSafeKeyFile(path);
 
     const bio = c.BIO_new_file(&path_buf, "r") orelse return error.FileOpenFailed;
     defer _ = c.BIO_free(bio);
@@ -629,13 +713,71 @@ test "signing key below the floor is refused at load, and inspectable with 0" {
     // permanently fails, so loading it for use is an error.
     try std.testing.expectError(
         error.RsaKeyTooSmall,
-        loadRsaKeyFile(key_path, RFC8301_MIN_RSA_BITS),
+        loadRsaKeyFile(key_path, RFC8301_MIN_RSA_BITS, .permit_any),
     );
 
     // 0 is the inspect-only path the key tools use: load it, report on it.
-    var key = try loadRsaKeyFile(key_path, 0);
+    var key = try loadRsaKeyFile(key_path, 0, .permit_any);
     defer key.deinit();
     try std.testing.expectEqual(@as(u32, 512), signingKeyBits(&key));
+}
+
+test "a key file another account can read is refused, before it is parsed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Deliberately not a key. The permission check runs before the PEM parse, so
+    // on a bad mode the mode error must win -- and that ordering is what this
+    // pins. Were the two swapped, every expectation below would see
+    // KeyParseFailed and the check would be dead code that still looked tested.
+    try tmp.dir.writeFile(.{ .sub_path = "k.pem", .data = "not a key\n" });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "k.pem");
+    defer std.testing.allocator.free(path);
+
+    var f = try tmp.dir.openFile("k.pem", .{});
+    defer f.close();
+
+    // 0600 passes the check and reaches the parser, which is how we know the
+    // check let it through rather than the check being skipped.
+    try f.chmod(0o600);
+    try std.testing.expectError(error.KeyParseFailed, loadRsaKeyFile(path, 0, .require_safe));
+
+    // Group-readable is a refusal even though the group may be the daemon's own.
+    try f.chmod(0o640);
+    try std.testing.expectError(error.KeyFilePermissionsTooOpen, loadRsaKeyFile(path, 0, .require_safe));
+
+    // So is other-readable, and so is any write bit: the rule is the whole of
+    // both triads, not the read bits.
+    try f.chmod(0o604);
+    try std.testing.expectError(error.KeyFilePermissionsTooOpen, loadRsaKeyFile(path, 0, .require_safe));
+    try f.chmod(0o620);
+    try std.testing.expectError(error.KeyFilePermissionsTooOpen, loadRsaKeyFile(path, 0, .require_safe));
+
+    // permit_any is the inspection path and must not care: it reaches the parser
+    // on a mode that require_safe rejects.
+    try f.chmod(0o644);
+    try std.testing.expectError(error.KeyParseFailed, loadRsaKeyFile(path, 0, .permit_any));
+}
+
+test "keyFileMode reports permission bits without the file-type bits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "m", .data = "x" });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "m");
+    defer std.testing.allocator.free(path);
+
+    var f = try tmp.dir.openFile("m", .{});
+    defer f.close();
+
+    // S_IFREG is 0o100000 and would swamp any unmasked comparison, which is the
+    // mistake this guards: a caller logging the raw st_mode prints 100644.
+    try f.chmod(0o600);
+    try std.testing.expectEqual(@as(u16, 0o600), try keyFileMode(path));
+
+    try f.chmod(0o644);
+    try std.testing.expectEqual(@as(u16, 0o644), try keyFileMode(path));
 }
 
 test "rsa key load from pem bytes" {

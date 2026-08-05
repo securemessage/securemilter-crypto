@@ -24,6 +24,48 @@
 #   fixes that each have their own regression test, and make the whole thing harder to
 #   review or revert. It belongs to the refactor stage that owns the other splits.
 #
+# 2026-08-04, the safe-key check: crypto.zig 410 -> 494.
+#
+#   From the security review the megaplan has carried unticked since the docs
+#   section was written -- "key file permissions, privilege drop, socket
+#   permissions". A DKIM or ARC private key is a bearer credential for a domain,
+#   and nothing in the suite looked at its mode before handing it to OpenSSL.
+#   `securedkim-genkey` has created keys 0600 at `open` since D-8, but that only
+#   covers keys this suite generated; one arriving from `openssl genrsa`, a
+#   backup, or a config-management system at 0644 was loaded without comment.
+#
+#   About eighteen lines of that are code -- `KeyFileTrust`, `keyFileMode`,
+#   `requireSafeKeyFile`, `KEY_PERMISSIONS_ADVICE`, and two lines inside
+#   `loadRsaKeyFile`. The rest is comment, and the two long passages are the ones
+#   a reader will otherwise have to reconstruct: why the check is a
+#   misconfiguration guard rather than an anti-TOCTOU measure (an attacker who
+#   can swap the file mid-load can equally write their own key there first), and
+#   why there is no `RequireSafeKeys` override when opendkim ships one (the key is
+#   re-read after the privilege drop, so the only arrangement that reloads is
+#   0600 owned by the daemon user -- which is exactly what the check accepts, so
+#   the flag could only ever be used to keep a key exposed).
+#
+#   ALL OF IT LANDS ON ONE SIDE OF THE SEAM THIS FILE ALREADY NAMED. The 2026-07-31
+#   note above proposed splitting "what a key is and how it is admitted" from "the
+#   operations", and every line added here is admission: a trust mode, a mode
+#   reader, an admission check, and a branch in a loader. The split therefore got
+#   both larger and better-motivated, not harder -- it now carries ~84 more lines
+#   away from a file whose operations half is unchanged.
+#
+#   Still not taken here, for the reason the earlier note gives and which applies
+#   unchanged: this is a security fix with its own regression tests, and burying
+#   it inside a module split would make it harder to review and harder to revert.
+#   The number to hit is set by the split, not by this entry.
+#
+# 2026-08-04: `loadRsaKeyFile` gained a THIRD required argument, `trust`.
+#
+#   Recorded because it is an API break across three repositories and nine call
+#   sites, and the reason it is required rather than defaulted is the same reason
+#   `min_bits` is: a new caller has to decide. The daemons and the two signing
+#   CLIs pass `.require_safe`; `securedkim-testkey` and `securearc-testkey` pass
+#   `.permit_any` and print the mode instead, because refusing to open a key is
+#   the one thing that would stop a tool whose entire job is to report on it.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -36,4 +78,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-410 src/crypto.zig
+494 src/crypto.zig
