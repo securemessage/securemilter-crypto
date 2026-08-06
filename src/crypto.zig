@@ -356,6 +356,48 @@ pub fn freePublicKey(pkey: *c.EVP_PKEY) void {
     c.EVP_PKEY_free(pkey);
 }
 
+/// Serialize a key's SubjectPublicKeyInfo -- exactly what a DKIM `p=` tag carries
+/// once base64-decoded.
+///
+/// The exact inverse of `loadRsaPublicKeyDer` above: `i2d_PUBKEY` writes the SPKI
+/// that `d2i_PUBKEY` reads. It is here because that pairing is the point. This
+/// suite wrote `p=` in **four** places -- both `testkey` tools, `securedkim-genkey`
+/// and this file's own test helper -- each with a private `@cImport` of
+/// `openssl/x509.h` reaching around the module that owns every other OpenSSL call.
+/// Eight duplicated lines is not the cost; the cost is that `p=` was produced four
+/// ways and parsed one way, with nothing making them agree.
+pub fn publicKeySpkiDer(allocator: Allocator, pkey: *const c.EVP_PKEY) ![]u8 {
+    const len = c.i2d_PUBKEY(pkey, null);
+    if (len <= 0) return error.PubkeyExportFailed;
+
+    const buf = try allocator.alloc(u8, @intCast(len));
+    errdefer allocator.free(buf);
+
+    // i2d_PUBKEY ADVANCES the pointer it is handed, so it gets a copy of
+    // `buf.ptr` -- passing the slice's own pointer would leave it one past the
+    // end of what was just written. Length re-checked because the second call is
+    // the one that writes, and a mismatch means the buffer is not what it says.
+    var out: [*c]u8 = buf.ptr;
+    if (c.i2d_PUBKEY(pkey, &out) != len) return error.PubkeyExportFailed;
+    return buf;
+}
+
+/// The public half of a loaded signing key, base64-encoded for a `p=` tag.
+///
+/// The form the key tools want: they hold a `SigningKey` and need the string that
+/// goes in DNS, so the DER buffer in between is nobody's business.
+///
+/// Ed25519 does not come through here. RFC 8463 §3 puts the bare 32-byte public
+/// key in `p=`, not an SPKI, and a caller holding an Ed25519 key already has it.
+pub fn publicKeySpkiBase64(allocator: Allocator, key: *const SigningKey) ![]u8 {
+    const pkey = key.rsa_pkey orelse return error.NotRsaKey;
+
+    const der = try publicKeySpkiDer(allocator, pkey);
+    defer allocator.free(der);
+
+    return base64Encode(allocator, der);
+}
+
 /// The `ed25519-sha256` DKIM signing algorithm, RFC 8463 §3.
 ///
 /// **`data` is the canonicalized signing input, and this function hashes it.**
@@ -595,17 +637,10 @@ fn testGenRsa(bits: c_int) !*c.EVP_PKEY {
     return pkey orelse error.KeygenFailed;
 }
 
-/// Serialize a key's SubjectPublicKeyInfo, which is exactly what a DKIM p= tag
-/// carries once base64-decoded.
+/// Was a fourth copy of the SPKI export; now the production one, so the tests
+/// exercise what the tools call.
 fn testSpkiDer(allocator: Allocator, pkey: *c.EVP_PKEY) ![]u8 {
-    const pkey_const: ?*const c.EVP_PKEY = @ptrCast(pkey);
-    const len = c.i2d_PUBKEY(pkey_const, null);
-    if (len <= 0) return error.PubkeyExportFailed;
-    const buf = try allocator.alloc(u8, @intCast(len));
-    errdefer allocator.free(buf);
-    var out: [*c]u8 = buf.ptr;
-    if (c.i2d_PUBKEY(pkey_const, &out) != len) return error.PubkeyExportFailed;
-    return buf;
+    return publicKeySpkiDer(allocator, pkey);
 }
 
 test "resolveMinRsaBits raises below the RFC 8301 floor and honours above it" {
@@ -641,6 +676,41 @@ test "public key at or above the minimum loads and reports its size" {
     const loaded = try loadRsaPublicKeyDer(der, RFC8301_MIN_RSA_BITS, &bits);
     defer freePublicKey(loaded);
     try std.testing.expectEqual(@as(u32, 2048), bits);
+}
+
+test "publicKeySpkiBase64 produces a p= the parser reads back" {
+    // The claim `publicKeySpkiDer` makes about itself: it is the inverse of
+    // `loadRsaPublicKeyDer`. Pinned as a round trip because the four copies this
+    // replaced had no test at all between them -- the only thing that had ever
+    // checked the export was a human comparing a DNS record by eye.
+    const pkey = try testGenRsa(2048);
+    const key = SigningKey{ .algorithm = .rsa_sha256, .rsa_pkey = pkey };
+    defer {
+        var k = key;
+        k.deinit();
+    }
+
+    const p_tag = try publicKeySpkiBase64(std.testing.allocator, &key);
+    defer std.testing.allocator.free(p_tag);
+
+    const der = try base64Decode(std.testing.allocator, p_tag);
+    defer std.testing.allocator.free(der);
+
+    var bits: u32 = 0;
+    const loaded = try loadRsaPublicKeyDer(der, RFC8301_MIN_RSA_BITS, &bits);
+    defer freePublicKey(loaded);
+    try std.testing.expectEqual(@as(u32, 2048), bits);
+}
+
+test "publicKeySpkiBase64 refuses an Ed25519 key rather than inventing an SPKI" {
+    // RFC 8463 §3 puts the bare 32-byte key in p=, so there is no SPKI to return
+    // and returning the RSA-shaped nothing would be worse than an error.
+    var key = try loadEd25519Seed([_]u8{7} ** 32);
+    defer key.deinit();
+    try std.testing.expectError(
+        error.NotRsaKey,
+        publicKeySpkiBase64(std.testing.allocator, &key),
+    );
 }
 
 test "512-bit public key is refused, and its size is still reported" {

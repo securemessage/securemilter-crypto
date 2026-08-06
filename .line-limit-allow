@@ -1,3 +1,25 @@
+# 2026-08-05, EVERY NUMBER BELOW PREDATES A CHANGE TO WHAT IS COUNTED. Read the
+#   figures in the older notes as historical; they do not describe these files now.
+#
+#   Until today `prod_lines` charged a comment sitting above ordinary code and
+#   freed one only above a `test` -- while the checker's own header stated the rule
+#   as "comments and tests never count". The code now does what the header always
+#   said it did. Across the six packages that moved the counted total from 21,353
+#   to 12,408 -- 41% of what was being measured was comment text -- and the count
+#   of files over the goal from 15 to 2, with no code removed anywhere.
+#
+#   So a ceiling quoted below is a comment-INCLUSIVE number and cannot be compared
+#   against one measured today. The reasoning in those notes stands unchanged; only
+#   their figures are on the old scale.
+#
+#   crypto.zig is the clearest case in the tree: 529 on the old scale, 244 on this
+#   one. It was never 529 lines of logic, and no ceiling for it survives.
+#
+#   THE CONSOLIDATION WORK IS NO LONGER JUSTIFIED BY LENGTH. Thirteen files stopped
+#   being flagged without losing a line of code. What still justifies it is
+#   duplication -- four copies of one tag scanner, two of one tool -- which this
+#   gate has never been able to see.
+#
 # 2026-07-31, C-1 and C-2: crypto.zig crosses the 400 goal at 410.
 #
 #   First entry on this list; the file had never been over. C-2 moved the Ed25519
@@ -66,6 +88,33 @@
 #   `.permit_any` and print the mode instead, because refusing to open a key is
 #   the one thing that would stop a tool whose entire job is to report on it.
 #
+# 2026-08-05, stage 5.1: crypto.zig 494 -> 529, and it is a net removal.
+#
+#   `publicKeySpkiDer` and `publicKeySpkiBase64` -- the `i2d_PUBKEY` inverse of
+#   `loadRsaPublicKeyDer`, which was already here. The export existed FOUR times
+#   before this: `securedkim/src/testkey.zig`, `securearc/src/testkey.zig`,
+#   `securedkim/src/genkey.zig`, and this file's own `testSpkiDer` helper. Each
+#   carried a private `@cImport` of `openssl/x509.h`, reaching around the module
+#   that owns every other OpenSSL call in the suite, and between the four of them
+#   there was no test: the only thing that had ever checked a `p=` was a human
+#   reading a DNS record. There are two tests now, one of them a round trip
+#   through `loadRsaPublicKeyDer` that pins the inverse claim.
+#
+#   Counting the two `testkey.zig` files this deletes from, the suite is ~470
+#   lines lighter. The ceiling is per file, so that shows up here as a raise.
+#
+#   `sig_header.zig` took `findTag` in the same commit and stayed under the goal,
+#   which is where the DNS key-record scanner belongs: a `p=` lookup obeys RFC
+#   6376 3.2 exactly as an `s=` lookup does, and the case rule is one both had to
+#   get right separately until now.
+#
+#   STILL OWED, AND THIS DOES NOT CHANGE IT: the split named in the 2026-07-31
+#   entry above. Both new functions land on its "key" side, so the number that
+#   split has to hit moves with them -- it now carries ~120 lines away, not ~84.
+#   Not taken here for the reason that entry already gives, applied the other way
+#   round: a deduplication that touches three repositories should not have a
+#   module split of a fourth buried inside it.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -78,4 +127,3 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-494 src/crypto.zig

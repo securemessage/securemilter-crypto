@@ -134,6 +134,56 @@ pub fn validateTagList(tag_list: []const u8) TagListError!void {
     if (count == 0) return error.EmptyTagList;
 }
 
+/// Value of one tag in a semicolon-separated tag-list, or null if absent.
+///
+/// `validateTagList` says whether a list is *legal*; this reads one value out of
+/// it. Both are here because both are RFC 6376 §3.2, and a caller that wants a
+/// selector out of an ARC-Seal or a `p=` out of a DNS key record should not be
+/// writing its own scanner to get it.
+///
+/// **Tag names are matched case sensitively.** §3.2: "Tags MUST be interpreted
+/// in a case-sensitive manner." This differs from DMARC, whose RFC 9989 §4.7 tag
+/// names are case *insensitive*, so the two must not share a tag scanner.
+///
+/// The difference is load-bearing rather than pedantic. Matching case
+/// insensitively made `S=dummy` satisfy a lookup for `s`, so an ARC-Seal whose
+/// selector tag was mis-cased was read as carrying a selector and went on to
+/// verify -- where the RFC has no `s=` tag at all and the seal cannot be checked.
+/// Applies equally to the `p=` lookup in a DKIM key record, which is the same
+/// kind of tag list.
+///
+/// Lenient where `validateTagList` is strict: it takes the first match and does
+/// not reject a duplicate. That division is deliberate. A caller that must refuse
+/// a malformed list calls the validator first -- `securearc` does, on every set
+/// it parses -- and one that is *reporting* on a record an operator handed it
+/// should say what is in there rather than refuse to look.
+///
+/// It trims `std.ascii.whitespace`, which is a wider set than the `FWS` its
+/// neighbour above uses: it also strips VT and FF, which RFC 5234 does not make
+/// whitespace. Kept exactly as it arrived from `securearc/src/arc.zig` so this
+/// move changes no behaviour. Narrowing it to `FWS` would make a key record
+/// carrying `p=<VT>AAAA` stop matching, which is a correctness change and wants
+/// its own commit and its own test, not a line inside a deduplication.
+pub fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
+    var rest = header_value;
+    while (rest.len > 0) {
+        rest = mem.trimLeft(u8, rest, &(.{';'} ++ FWS));
+        if (rest.len == 0) break;
+
+        const eq_pos = mem.indexOfScalar(u8, rest, '=') orelse break;
+        const name = mem.trim(u8, rest[0..eq_pos], &std.ascii.whitespace);
+
+        const value_start = eq_pos + 1;
+        const semi_pos = mem.indexOfScalar(u8, rest[value_start..], ';');
+        const value_end = if (semi_pos) |sp| value_start + sp else rest.len;
+        const value = mem.trim(u8, rest[value_start..value_end], &std.ascii.whitespace);
+
+        if (mem.eql(u8, name, tag_name)) return value;
+        rest = if (semi_pos) |sp| rest[value_start + sp + 1 ..] else "";
+    }
+    return null;
+}
+
 const FWS = [_]u8{ ' ', '\t', '\r', '\n' };
 
 fn isAlpha(c: u8) bool {
@@ -384,4 +434,45 @@ test "validateTagList bounds the duplicate scan" {
         try buf.writer(std.testing.allocator).print("a{d}=x;", .{i});
     }
     try std.testing.expectError(error.TooManyTags, validateTagList(buf.items));
+}
+
+test "findTag" {
+    const val = "i=1; cv=pass; a=rsa-sha256; d=example.com; s=arc2026; b=AAAA==";
+    try std.testing.expectEqualStrings("1", findTag(val, "i").?);
+    try std.testing.expectEqualStrings("pass", findTag(val, "cv").?);
+    try std.testing.expectEqualStrings("rsa-sha256", findTag(val, "a").?);
+    try std.testing.expectEqualStrings("example.com", findTag(val, "d").?);
+    try std.testing.expectEqualStrings("arc2026", findTag(val, "s").?);
+    try std.testing.expectEqualStrings("AAAA==", findTag(val, "b").?);
+    try std.testing.expect(findTag(val, "x") == null);
+}
+
+test "findTag matches tag names case sensitively (RFC 6376 3.2)" {
+    // "Tags MUST be interpreted in a case-sensitive manner." A mis-cased tag is
+    // a DIFFERENT tag, not the same one written oddly, so the tag it was meant
+    // to be is absent.
+    const mis_cased = "i=1; cv=none; a=rsa-sha256; d=example.org; S=dummy; t=12345";
+    try std.testing.expect(findTag(mis_cased, "s") == null);
+    try std.testing.expectEqualStrings("dummy", findTag(mis_cased, "S").?);
+
+    // While this matched case insensitively, an ARC-Seal carrying `S=` was read
+    // as having a selector and went on to verify against a key it named by
+    // accident. The suite case is `as_format_tags_key_case`.
+    const correct = "i=1; cv=none; a=rsa-sha256; d=example.org; s=dummy";
+    try std.testing.expectEqualStrings("dummy", findTag(correct, "s").?);
+}
+
+test "findTag reads a DNS key record, which is the same kind of tag list" {
+    // The reason this function is shared rather than copied into the key tools:
+    // `p=` in a §3.6.1 key record is looked up by exactly the rules `s=` in a
+    // signature is, and a second scanner is a second chance to get the case rule
+    // wrong. `k=` defaulting to rsa when absent belongs to the caller.
+    const rec = "v=DKIM1; k=rsa; p=MIIBIjANBgkq";
+    try std.testing.expectEqualStrings("MIIBIjANBgkq", findTag(rec, "p").?);
+    try std.testing.expectEqualStrings("rsa", findTag(rec, "k").?);
+    try std.testing.expect(findTag(rec, "h") == null);
+
+    // A revoked key is an empty p=, not a missing one -- the tools distinguish
+    // them, so the scanner has to.
+    try std.testing.expectEqualStrings("", findTag("v=DKIM1; p=", "p").?);
 }
